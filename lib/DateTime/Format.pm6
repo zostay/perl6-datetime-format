@@ -105,9 +105,115 @@ multi sub strftime (
 
 ## Parse a string and return a DateTime, uses the same format strings
 ## as strftime().
-## TODO: implement me.
-sub strptime ($string, $format, :$lang=$datetime-format-lang) is export {
- !!!
+sub strptime (
+    Str $string, 
+    Str $format, 
+    Str :$lang=$datetime-format-lang,
+    DateTime :$now=DateTime.now) is export {
+
+    # TODO Some of these values are overly broad in what they match and result
+    # in obtuse and difficult to follow parse errors.
+    my %parsers =
+        # Standard
+        'Y' => regex { $<year>   = [ <[0..9]> ** 1..4 ] },
+        'm' => regex { $<month>  = [ <[0..9]> ** 1..2 ] },
+        'd' => regex { $<day>    = [ <[0..9]> ** 1..2 ] },
+        'H' => regex { $<hour>   = [ <[0..9]> ** 1..2 ] },
+        'M' => regex { $<minute> = [ <[0..9]> ** 1..2 ] },
+        'S' => regex { $<second> = [ <[0..9]> ** 1..2 ] },
+        # Special
+        'a' => regex { $<day-of-week-abbr> = [ @($day-names{ $lang }.map({ .substr(0,3) })) ] },
+        'A' => regex { $<day-of-week-name> = [ @($day-names{ $lang }) ] },
+        'b' => regex { $<month-abbr>       = [ @($month-names{ $lang }.map({ .substr(0, 3) })) ] },
+        'B' => regex { $<month-name>       = [ @($month-names{ $lang }) ] },
+        'C' => regex { $<century>          = [ <[0..9]> ** 1..2 ] },
+        'e' => regex { $<day>              = [ <[0..9]> ** 1..2 ] },
+        'I' => regex { $<hour-ambig>       = [ <[0..9]> ** 1..2 ] },
+        'k' => regex { $<hour>             = [ <[0..9]> ** 1..2 ] },
+        'l' => regex { $<hour-ambig>       = [ <[0..9]> ** 1..2 ] },
+        'n' => regex { "\n" },
+        'N' => regex { $<nanosecond>       = [ <[0..9]> ** 1..9 ] },
+        'p' => regex { $<meridiem>         = [ 'AM' | 'PM' | 'am' | 'pm' ] },
+        'P' => regex { $<meridiem>         = [ 'AM' | 'PM' | 'am' | 'pm' ] },
+        's' => regex { $<epoch>            = [ <[0..9]>+ ] },
+        't' => regex { "\t" },
+        'u' => regex { $<day-of-week>      = [ <[0..9]> ] },
+        'w' => regex { $<day-of-week-alt>  = [ <[0..9]> ] },
+        'y' => regex { $<year>             = [ <[0..9]> ** 1..4 ] },
+        '%' => regex { '%' },
+        '3N'=> regex { $<millisecond>      = [ <[0..9]> ** 1..3 ] },
+        '6N'=> regex { $<microsecond>      = [ <[0..9]> ** 1..6 ] },
+        '9N'=> regex { $<nanosecond>       = [ <[0..9]> ** 1..9 ] },
+        'z' => regex { $<tz>               = [ 'Z' | <[ + - ]> <[0..9]> ** 4 ] },
+    ;
+
+    %parsers = %parsers,
+        # Aggregates
+        'F' => regex { $(%parsers<Y>) '-' $(%parsers<m>) '-' $(%parsers<d>) },
+        'r' => regex { $(%parsers<I>) ':' $(%parsers<M>) ':' $(%parsers<S>) $(%parsers<p>) },
+        'R' => regex { $(%parsers<H>) ':' $(%parsers<M>) },
+        'T' => regex { $(%parsers<H>) ':' $(%parsers<M>) ':' $(%parsers<S>) },
+        'x' => regex { $(%parsers<Y>) '-' $(%parsers<m>) '-' $(%parsers<d>) },
+        'X' => regex { $(%parsers<H>) ':' $(%parsers<M>) ':' $(%parsers<S>) },
+    ;
+
+    # This grammar builds a regex from the format string
+    my grammar Strptime {
+        token TOP {
+            <term>+ { make $<term>.reduce(-> $a, $b { 
+                my Regex:D $rxa = $a.made if $a.^can('made');
+                my Regex:D $rxb = $b.made;
+                note "# rx/{$rxa.perl}{$rxb.perl}/";
+                rx{$rxa$rxb} 
+            }) }
+        }
+
+        token term {
+            || <spec> { make $<spec>.made }
+            || <char> { make rx{$<char>} }
+        }
+
+        token spec { 
+            '%' ( \dN | \w | '%' ) 
+            { make %parsers{$0} // rx{ "%$0" } }
+        }
+        token char { . }
+    }
+
+    my $ast = Strptime.parse($format);
+    die "unable to parse format: $format" unless $ast;
+    my $rx = $ast.made;
+
+    die "unable to parse date string" unless $string ~~ rx{^$rx};
+
+    my %name-months = $month-names{$lang}.kv, 
+                      $month-names{$lang}.map({ .substr(0,3) }).kv;
+    my %name-days   = $day-names{$lang}.kv,
+                      $day-names{$lang}.map({ .substr(0,3) }).kv;
+
+    my $timezone = $<tz> eq 'Z' ?? 0 !! Int($<tz>) // 0;
+
+    return DateTime.new(Int($<epoch>), :$timezone) if $<epoch>;
+
+    my $now = DateTime.now(:$timezone);
+
+    my $year   = Int(($<century> // floor($<year>/100)) * 100 + $<year>%100 // $now.year);
+    my $month  = Int($<month> // %name-months{$<month-name> // $<month-abbr>} // $now.month);
+    my $day    = Int($<day> // $now.day);
+    my $hour   = Int($<hour> // ($<hour-ambig> + 12 * ?($<meridiem> ~~ m:i/am/)));
+    my $minute = Int($<minute> // $now.minute);
+    my $second = Int(
+        $<second> + ($<nanosecond>  / 1000000000
+                  // $<microsecond> / 1000000
+                  // $<millesecond> / 1000)
+        // $now.second
+    );
+
+    DateTime.new(
+        :$year, :$month, :$day,
+        :$hour, :$minute, :$second,
+        :$timezone,
+    );
 }
 
 ## Returns the language-specific day name.
